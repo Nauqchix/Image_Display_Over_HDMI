@@ -1,0 +1,25 @@
+# firmware build
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+
+# python
+__pycache__/
+*.pyc
+
+# Vivado
+*.jou
+*.log
+*.str
+*.cache/
+*.hw/
+*.runs/
+*.sim/
+*.ip_user_files/
+*.gen/
+
+# OS
+.DS_Store
+Thumbs.db
