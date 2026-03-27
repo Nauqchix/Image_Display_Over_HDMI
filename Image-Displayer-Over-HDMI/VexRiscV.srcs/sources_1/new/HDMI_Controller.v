@@ -143,35 +143,50 @@ assign pix_clk_out = pixclk;
 // counter and sync generation
 reg [9:0] CounterX = 0, CounterY = 0;
 reg hSync, vSync, DrawArea;
+
+// Pipeline stage 1: next-pixel address (1 cycle ahead of CounterX/Y)
+// The dual-port RAM has 1-cycle read latency on port B, so we must issue
+// the address one cycle before we need the pixel data.
+wire [9:0] nextX_w = (CounterX == 799) ? 0 : CounterX + 1;
+wire [9:0] nextY_w = (CounterX == 799) ? ((CounterY == 524) ? 0 : CounterY + 1) : CounterY;
+
 always @(posedge pixclk)
-    begin  
-        DrawArea <= (CounterX<640) && (CounterY<480);           // define picture dimensions for 640x480 (off-screen data 800x525)
-        CounterX <= (CounterX==799) ? 0 : CounterX+1;           // horizontal counter (including off-screen horizontal 160 pixels) total of 800 pixels 
-        if(CounterX==799) 
-            CounterY <= (CounterY==524) ? 0 : CounterY+1;       /* vertical counter (including off-screen vertical 45 pixels) total of 525 pixels
-                                                                   only counts up 1 count after horizontal finishes. */                                                          
-        hSync <= (CounterX>=656) && (CounterX<752);         // hsync high for 96 counts                                                 
-        vSync <= (CounterY>=490) && (CounterY<492);         // vsync high for 2 counts
-        if (CounterX < 300 && CounterY < 300)
-            fb_addr <= CounterY * 300 + CounterX;
+    begin
+        // Advance counters
+        CounterX <= (CounterX==799) ? 0 : CounterX+1;
+        if(CounterX==799)
+            CounterY <= (CounterY==524) ? 0 : CounterY+1;
+
+        // Sync and draw-area signals are registered 1 cycle (they align with
+        // CounterX/Y at the time they are captured by the TMDS encoder).
+        DrawArea <= (CounterX<640) && (CounterY<480);
+        hSync    <= (CounterX>=656) && (CounterX<752);
+        vSync    <= (CounterY>=490) && (CounterY<492);
+
+        // Issue the framebuffer address ONE cycle early so that the synchronous
+        // RAM result arrives exactly when DrawArea / color regs are updated.
+        // nextX_w / nextY_w are the coords that will be active on the NEXT cycle.
+        if (nextX_w < 300 && nextY_w < 300)
+            fb_addr <= nextY_w * 300 + nextX_w;
         else
             fb_addr <= 0;
     end
-// end counter and sync generation  
+// end counter and sync generation
 
 ///////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////
-// color generation (not part of HDMI standard, jsut for generating some patterns)
+// color generation
+// 'pixel' is the RAM output registered on the PREVIOUS cycle (1-cycle latency),
+// so it now correctly corresponds to the current CounterX/Y position.
 reg [7:0] red, green, blue;
 
 always @(posedge pixclk) begin
     if (CounterX < 300 && CounterY < 300) begin
-        // pixel inside 300x300 region - HIỂN THỊ ẢNH
-        red   <= {pixel[15:11], 3'b0};   // ví dụ màu đỏ
-        green <= {pixel[10:5], 2'b0};
-        blue  <= {pixel[4:0], 3'b0};
+        // pixel inside 300x300 region – display image
+        red   <= {pixel[15:11], 3'b0};
+        green <= {pixel[10:5],  2'b0};
+        blue  <= {pixel[4:0],   3'b0};
     end else begin
-        // pixel ngoài vùng - ĐEN
+        // outside image region – black
         red   <= 8'h00;
         green <= 8'h00;
         blue  <= 8'h00;

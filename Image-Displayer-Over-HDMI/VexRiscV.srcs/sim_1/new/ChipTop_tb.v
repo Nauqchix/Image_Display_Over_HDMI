@@ -19,7 +19,7 @@ module ChipTop_tb;
 
     initial begin
         sys_resetn = 0;
-        #100;
+        rgb(133, 50, 50);
         sys_resetn = 1; // release reset after 100ns
     end
 

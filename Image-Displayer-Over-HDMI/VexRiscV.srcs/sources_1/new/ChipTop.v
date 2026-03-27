@@ -5,13 +5,13 @@
 // - Instruction ROM
 // - System RAM shared with framebuffer
 // - Memory-mapped HDMI control registers
-// - HDMI output via existing HDMI_Encode module
+// - UART RX for image upload
 //////////////////////////////////////////////////////////////////////////////////
 
 module ChipTop (
     input  wire       sys_clk,        // 125 MHz
     input  wire       sys_resetn,     // active-low reset
-    input wire uart_rx,
+    input  wire       uart_rx,
 
     output wire [2:0] hdmi_tx_p,
     output wire [2:0] hdmi_tx_n,
@@ -26,7 +26,7 @@ module ChipTop (
     // 1. Clock / Reset
     // ============================================================
     wire clk   = sys_clk;
-    wire reset = ~sys_resetn;
+    wire reset = sys_resetn;
 
     reg [25:0] heartbeat_cnt;
     always @(posedge clk or posedge reset) begin
@@ -47,7 +47,6 @@ module ChipTop (
 
     localparam PERIPH_BASE = 32'hF000_0000;
 
-    // Peripheral offsets
     localparam REG_HDMI_ENABLE = 32'h0000_0000;
     localparam REG_FB_BASE     = 32'h0000_0004;
     localparam REG_STATUS      = 32'h0000_0008;
@@ -126,7 +125,6 @@ module ChipTop (
     initial begin
         for (i = 0; i < ROM_WORDS; i = i + 1)
             instr_mem[i] = 32'h00000013; // NOP
-
         $readmemh("firmware_vex.hex", instr_mem);
     end
 
@@ -141,7 +139,7 @@ module ChipTop (
         end else begin
             instr_valid_reg <= 1'b0;
 
-            if (iBus_cmd_valid && iBus_cmd_ready) begin
+            if (iBus_cmd_valid) begin
                 if (iBus_hit_rom)
                     instr_data_reg <= instr_mem[iBus_word_addr];
                 else
@@ -158,7 +156,7 @@ module ChipTop (
     assign iBus_rsp_payload_error = 1'b0;
 
     // ============================================================
-    // 6. Decode for dBus
+    // 6. dBus decode
     // ============================================================
     wire        dBus_hit_ram    = (dBus_cmd_payload_address >= RAM_BASE) &&
                                   (dBus_cmd_payload_address < (RAM_BASE + RAM_WORDS*4));
@@ -171,15 +169,70 @@ module ChipTop (
     // 7. Peripheral registers
     // ============================================================
     reg        reg_hdmi_enable;
-    reg [31:0] reg_fb_base_word;   // word address inside RAM space
+    reg [31:0] reg_fb_base_word;
     reg [1:0]  reg_led_ctrl;
+
+    // UART regs
+    wire [7:0] uart_rx_data;
+    wire       uart_rx_valid;
+    reg  [7:0] uart_data_reg;
+    reg        uart_data_ready;
+    reg        uart_overrun;
+
+    wire uart_data_read_pulse =
+        dBus_cmd_valid &&
+        !dBus_cmd_payload_wr &&
+        dBus_hit_periph &&
+        ((dBus_cmd_payload_address - PERIPH_BASE) == REG_UART_DATA);
+
+    wire uart_status_write_clear =
+        dBus_cmd_valid &&
+        dBus_cmd_payload_wr &&
+        dBus_hit_periph &&
+        ((dBus_cmd_payload_address - PERIPH_BASE) == REG_UART_STATUS) &&
+        dBus_cmd_payload_mask[0] &&
+        dBus_cmd_payload_data[0];
+
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            uart_data_reg   <= 8'd0;
+            uart_data_ready <= 1'b0;
+            uart_overrun    <= 1'b0;
+        end else begin
+            if (uart_status_write_clear)
+                uart_overrun <= 1'b0;
+
+            case ({uart_data_read_pulse, uart_rx_valid})
+                2'b10: begin
+                    uart_data_ready <= 1'b0;
+                end
+
+                2'b01: begin
+                    if (!uart_data_ready) begin
+                        uart_data_reg   <= uart_rx_data;
+                        uart_data_ready <= 1'b1;
+                    end else begin
+                        uart_overrun <= 1'b1;
+                    end
+                end
+
+                2'b11: begin
+                    uart_data_reg   <= uart_rx_data;
+                    uart_data_ready <= 1'b1;
+                end
+
+                default: begin
+                end
+            endcase
+        end
+    end
 
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             reg_hdmi_enable  <= 1'b1;
             reg_fb_base_word <= 32'd0;
             reg_led_ctrl     <= 2'b00;
-        end else if (dBus_cmd_valid && dBus_cmd_ready && dBus_cmd_payload_wr && dBus_hit_periph) begin
+        end else if (dBus_cmd_valid && dBus_cmd_payload_wr && dBus_hit_periph) begin
             case (dBus_cmd_payload_address - PERIPH_BASE)
                 REG_HDMI_ENABLE: begin
                     if (dBus_cmd_payload_mask[0])
@@ -187,7 +240,10 @@ module ChipTop (
                 end
 
                 REG_FB_BASE: begin
-                    reg_fb_base_word <= dBus_cmd_payload_data;
+                    if (dBus_cmd_payload_mask[0]) reg_fb_base_word[7:0]   <= dBus_cmd_payload_data[7:0];
+                    if (dBus_cmd_payload_mask[1]) reg_fb_base_word[15:8]  <= dBus_cmd_payload_data[15:8];
+                    if (dBus_cmd_payload_mask[2]) reg_fb_base_word[23:16] <= dBus_cmd_payload_data[23:16];
+                    if (dBus_cmd_payload_mask[3]) reg_fb_base_word[31:24] <= dBus_cmd_payload_data[31:24];
                 end
 
                 REG_LED_CTRL: begin
@@ -203,7 +259,6 @@ module ChipTop (
 
     // ============================================================
     // 8. System RAM
-    //    Shared by CPU and HDMI framebuffer reader
     // ============================================================
     wire [31:0] cpu_ram_rdata;
     wire [31:0] hdmi_ram_rdata;
@@ -213,83 +268,75 @@ module ChipTop (
     reg [16:0] cpu_ram_addr_r;
     reg [31:0] cpu_ram_wdata_r;
 
-always @(posedge clk or posedge reset) begin
-    if (reset) begin
-        cpu_ram_we_r    <= 1'b0;
-        cpu_ram_be_r    <= 4'b0;
-        cpu_ram_addr_r  <= 17'd0;
-        cpu_ram_wdata_r <= 32'd0;
-    end else begin
-        cpu_ram_we_r <= dBus_cmd_valid && dBus_cmd_payload_wr && dBus_hit_ram;
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            cpu_ram_we_r    <= 1'b0;
+            cpu_ram_be_r    <= 4'b0000;
+            cpu_ram_addr_r  <= 17'd0;
+            cpu_ram_wdata_r <= 32'd0;
+        end else begin
+            cpu_ram_we_r <= dBus_cmd_valid && dBus_cmd_payload_wr && dBus_hit_ram;
 
-        if (dBus_cmd_valid && dBus_hit_ram) begin
-            cpu_ram_be_r    <= dBus_cmd_payload_mask;
-            cpu_ram_addr_r  <= dBus_ram_word_addr[16:0];
-            cpu_ram_wdata_r <= dBus_cmd_payload_data;
+            if (dBus_cmd_valid && dBus_hit_ram) begin
+                cpu_ram_be_r    <= dBus_cmd_payload_mask;
+                cpu_ram_addr_r  <= dBus_ram_word_addr[16:0];
+                cpu_ram_wdata_r <= dBus_cmd_payload_data;
+            end
         end
     end
-end
 
-
-    wire pix_clk;
+    wire        pix_clk;
     wire [16:0] fb_rd_addr;
-    wire [16:0] hdmi_pixel_word_offset;
     wire [31:0] hdmi_word_addr_full;
     wire [16:0] hdmi_word_addr;
 
-    assign hdmi_pixel_word_offset = {1'b0, fb_rd_addr[16:1]};
-    assign hdmi_word_addr_full    = reg_fb_base_word + {15'd0, hdmi_pixel_word_offset};
-    assign hdmi_word_addr         = hdmi_word_addr_full[16:0];
+    assign hdmi_word_addr_full = reg_fb_base_word + {15'd0, fb_rd_addr[16:1]};
+    assign hdmi_word_addr      = hdmi_word_addr_full[16:0];
 
-DualPortRam #(
-    .ADDR_WIDTH(17),
-    .DATA_WIDTH(32)
-) u_ram (
-    .a_clk   (clk),
-    .a_we    (cpu_ram_we_r),
-    .a_be    (cpu_ram_be_r),
-    .a_addr  (cpu_ram_addr_r),
-    .a_wdata (cpu_ram_wdata_r),
-    .a_rdata (cpu_ram_rdata),
+    DualPortRam #(
+        .ADDR_WIDTH(17),
+        .DATA_WIDTH(32)
+    ) u_ram (
+        .a_clk   (clk),
+        .a_we    (cpu_ram_we_r),
+        .a_be    (cpu_ram_be_r),
+        .a_addr  (cpu_ram_addr_r),
+        .a_wdata (cpu_ram_wdata_r),
+        .a_rdata (cpu_ram_rdata),
 
-    .b_clk   (pix_clk),
-    .b_en    (1'b1),
-    .b_addr  (hdmi_word_addr),
-    .b_rdata (hdmi_ram_rdata)
-);
+        .b_clk   (pix_clk),
+        .b_en    (1'b1),
+        .b_addr  (hdmi_word_addr),
+        .b_rdata (hdmi_ram_rdata)
+    );
 
     // ============================================================
     // 9. CPU data bus handling
-    //    One-cycle response to match synchronous RAM
     // ============================================================
     reg        dBus_rsp_valid_reg;
     reg [31:0] dBus_rdata_reg;
-
     reg        dBus_pending_ram;
     reg        dBus_pending_periph;
     reg        dBus_pending_other;
     reg [31:0] dBus_pending_addr;
-    reg        dBus_pending_wr;
 
     assign dBus_cmd_ready = 1'b1;
-    assign dBus_rsp_ready = dBus_rsp_valid_reg;
     assign dBus_rsp_error = 1'b0;
     assign dBus_rsp_data  = dBus_rdata_reg;
+
+    assign dBus_rsp_ready = dBus_rsp_valid_reg;
 
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             dBus_rsp_valid_reg <= 1'b0;
             dBus_rdata_reg     <= 32'd0;
-
             dBus_pending_ram   <= 1'b0;
             dBus_pending_periph<= 1'b0;
             dBus_pending_other <= 1'b0;
             dBus_pending_addr  <= 32'd0;
-            dBus_pending_wr    <= 1'b0;
         end else begin
             dBus_rsp_valid_reg <= 1'b0;
 
-            // phase 2: generate response for previous cycle request
             if (dBus_pending_ram) begin
                 dBus_rdata_reg     <= cpu_ram_rdata;
                 dBus_rsp_valid_reg <= 1'b1;
@@ -300,7 +347,7 @@ DualPortRam #(
                     REG_STATUS:      dBus_rdata_reg <= {30'd0, sys_resetn, hdmi_tx_hpdn};
                     REG_LED_CTRL:    dBus_rdata_reg <= {30'd0, reg_led_ctrl};
                     REG_UART_DATA:   dBus_rdata_reg <= {24'd0, uart_data_reg};
-                    REG_UART_STATUS: dBus_rdata_reg <= {31'd0, uart_data_ready};
+                    REG_UART_STATUS: dBus_rdata_reg <= {30'd0, uart_overrun, uart_data_ready};
                     default:         dBus_rdata_reg <= 32'd0;
                 endcase
                 dBus_rsp_valid_reg <= 1'b1;
@@ -309,97 +356,71 @@ DualPortRam #(
                 dBus_rsp_valid_reg <= 1'b1;
             end
 
-            // clear pending flags
             dBus_pending_ram    <= 1'b0;
             dBus_pending_periph <= 1'b0;
             dBus_pending_other  <= 1'b0;
             dBus_pending_addr   <= 32'd0;
-            dBus_pending_wr     <= 1'b0;
 
-            // phase 1: accept new request
-            if (dBus_cmd_valid && dBus_cmd_ready) begin
+            if (dBus_cmd_valid) begin
                 dBus_pending_addr <= dBus_cmd_payload_address;
-                dBus_pending_wr   <= dBus_cmd_payload_wr;
-
-                // For both read and write, return one response beat.
-                // RAM uses synchronous read, so response is generated next cycle.
-                if (dBus_hit_ram) begin
+                if (dBus_hit_ram)
                     dBus_pending_ram <= 1'b1;
-                end else if (dBus_hit_periph) begin
+                else if (dBus_hit_periph)
                     dBus_pending_periph <= 1'b1;
-                end else begin
+                else
                     dBus_pending_other <= 1'b1;
-                end
             end
         end
     end
 
     // ============================================================
     // 10. HDMI framebuffer read path
-    //     1 word RAM contains 2 pixels RGB565
     // ============================================================
+    // Port B of the RAM is synchronous: b_rdata is valid one pix_clk cycle
+    // AFTER b_addr is applied. fb_rd_addr changes on the same edge that
+    // captures b_rdata, so we delay fb_rd_addr[0] by one cycle to keep the
+    // even/odd pixel select aligned with the actual RAM output word.
+    reg fb_rd_addr0_d;
+    always @(posedge pix_clk)
+        fb_rd_addr0_d <= fb_rd_addr[0];
+
     wire [15:0] fb_rd_data;
-
     assign fb_rd_data = reg_hdmi_enable
-                        ? (fb_rd_addr[0] ? hdmi_ram_rdata[31:16] : hdmi_ram_rdata[15:0])
-                        : 16'h0000;
+                      ? (fb_rd_addr0_d ? hdmi_ram_rdata[31:16] : hdmi_ram_rdata[15:0])
+                      : 16'h0000;
 
     // ============================================================
-    // 11. HDMI output engine
+    // 11. HDMI output
     // ============================================================
     HDMI_Encode hdmi_en (
-    .pixel       (fb_rd_data),
-    .clk         (clk),
-    .TMDSp       (hdmi_tx_p),
-    .TMDSn       (hdmi_tx_n),
-    .TMDSp_clock (hdmi_clk_p),
-    .TMDSn_clock (hdmi_clk_n),
-    .fb_addr     (fb_rd_addr),
-    .pix_clk_out (pix_clk)
-);
+        .pixel       (fb_rd_data),
+        .clk         (clk),
+        .TMDSp       (hdmi_tx_p),
+        .TMDSn       (hdmi_tx_n),
+        .TMDSp_clock (hdmi_clk_p),
+        .TMDSn_clock (hdmi_clk_n),
+        .fb_addr     (fb_rd_addr),
+        .pix_clk_out (pix_clk)
+    );
+
     // ============================================================
-    // 12. UART
+    // 12. UART receiver
     // ============================================================
-wire [7:0] uart_rx_data;
-wire uart_rx_valid;
-reg  [7:0] uart_data_reg;
-reg uart_data_ready;
-
-always @(posedge clk or posedge reset) begin
-    if (reset) begin
-        uart_data_reg   <= 8'd0;
-        uart_data_ready <= 1'b0;
-    end else begin
-        if (uart_rx_valid) begin
-            uart_data_reg   <= uart_rx_data;
-            uart_data_ready <= 1'b1;
-        end
-
-        // CPU đọc DATA thì clear cờ ready
-        if (dBus_cmd_valid && dBus_cmd_ready &&
-            !dBus_cmd_payload_wr &&
-            dBus_hit_periph &&
-            ((dBus_cmd_payload_address - PERIPH_BASE) == REG_UART_DATA)) begin
-            uart_data_ready <= 1'b0;
-        end
-    end
-end
-
-uart_rx #(
-    .CLK_FREQ(125_000_000),
-    .BAUD_RATE(921600)
-) u_uart_rx (
-    .clk(clk),
-    .reset(reset),
-    .rx(uart_rx),
-    .data_out(uart_rx_data),
-    .data_valid(uart_rx_valid)
-);
+    uart_rx #(
+        .CLK_FREQ (125_000_000),
+        .BAUD_RATE(115200)
+    ) u_uart_rx (
+        .clk       (clk),
+        .reset     (reset),
+        .rx        (uart_rx),
+        .data_out  (uart_rx_data),
+        .data_valid(uart_rx_valid)
+    );
 
     // ============================================================
     // 13. LEDs
     // ============================================================
-    assign led[0] = reg_led_ctrl[0] ^ heartbeat_cnt[25];
-    assign led[1] = reg_led_ctrl[1] ^ ~hdmi_tx_hpdn;
+    assign led[0] = reg_led_ctrl[0];
+    assign led[1] = heartbeat_cnt[25];
 
 endmodule
